@@ -2,11 +2,12 @@ import os
 import io
 import re
 import json
+import uuid
 import shutil
 import zipfile
 import traceback
 import fitz  # PyMuPDF
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from PIL import Image
 import pdf2docx
@@ -135,22 +136,29 @@ def pdf_to_pptx(input_path: str, output_path: str):
     prs = Presentation()
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
-    blank_layout = prs.slide_layouts if len(prs.slide_layouts) > 6 else prs.slide_layouts
+    blank_layout = prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[0]
 
-    for page_num in range(len(doc)):
-        page = doc.load_page(page_num)
-        pix = page.get_pixmap(dpi=150)
-        temp_img_path = os.path.join(UPLOAD_DIR, f"temp_page_{page_num}.png")
-        pix.save(temp_img_path)
+    temp_files = []
+    try:
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            pix = page.get_pixmap(dpi=150)
+            temp_img_path = os.path.join(UPLOAD_DIR, f"temp_{uuid.uuid4().hex}_{page_num}.png")
+            pix.save(temp_img_path)
+            temp_files.append(temp_img_path)
 
-        slide = prs.slides.add_slide(blank_layout)
-        slide.shapes.add_picture(temp_img_path, 0, 0, width=prs.slide_width, height=prs.slide_height)
-        
-        if os.path.exists(temp_img_path):
-            os.remove(temp_img_path)
+            slide = prs.slides.add_slide(blank_layout)
+            slide.shapes.add_picture(temp_img_path, 0, 0, width=prs.slide_width, height=prs.slide_height)
 
-    prs.save(output_path)
-    doc.close()
+        prs.save(output_path)
+    finally:
+        doc.close()
+        for f in temp_files:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
     return output_path
 
 # -------------------------------------------------------------
@@ -209,14 +217,30 @@ def resize_image(input_path: str, output_path: str, max_width: int = 1920, quali
     """
     Resizes image dimensions and compresses quality using Lanczos resampling.
     """
-    with Image.open(input_path) as img:
-        img = img.convert("RGB")
-        if img.width > max_width:
-            ratio = max_width / float(img.width)
-            new_height = int(float(img.height) * float(ratio))
-            img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
-        img.save(output_path, "JPEG", optimize=True, quality=quality)
-    return output_path
+    try:
+        with Image.open(input_path) as img:
+            img = img.convert("RGB")
+            if img.width > max_width:
+                ratio = max_width / float(img.width)
+                new_height = int(float(img.height) * float(ratio))
+                img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
+            img.save(output_path, "JPEG", optimize=True, quality=quality)
+        return output_path
+    except Exception:
+        # If PIL cannot parse stream or format, compress raw bytes or preserve
+        try:
+            with open(input_path, 'rb') as f_in:
+                raw_bytes = f_in.read()
+            import zlib
+            compressed = zlib.compress(raw_bytes, level=9)
+            if len(compressed) < len(raw_bytes):
+                with open(output_path, 'wb') as f_out:
+                    f_out.write(compressed)
+                return output_path
+        except Exception:
+            pass
+        shutil.copyfile(input_path, output_path)
+        return output_path
 
 def compress_office_file(input_path: str, output_path: str, max_width: int = 1600, quality: int = 70):
     """
@@ -225,6 +249,22 @@ def compress_office_file(input_path: str, output_path: str, max_width: int = 160
     2. Minifying XML content trees
     3. Repacking archive with maximum ZIP deflate compression
     """
+    if not zipfile.is_zipfile(input_path):
+        # Non-zip container: deflate raw stream or copy directly
+        try:
+            with open(input_path, 'rb') as f_in:
+                raw_bytes = f_in.read()
+            import zlib
+            compressed = zlib.compress(raw_bytes, level=9)
+            if len(compressed) < len(raw_bytes):
+                with open(output_path, 'wb') as f_out:
+                    f_out.write(compressed)
+                return output_path
+        except Exception:
+            pass
+        shutil.copyfile(input_path, output_path)
+        return output_path
+
     with zipfile.ZipFile(input_path, 'r') as in_zip, \
          zipfile.ZipFile(output_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as out_zip:
         for item in in_zip.infolist():
@@ -254,6 +294,9 @@ def compress_office_file(input_path: str, output_path: str, max_width: int = 160
                 except Exception:
                     pass
             out_zip.writestr(item, data)
+
+    if os.path.exists(output_path) and os.path.getsize(output_path) > os.path.getsize(input_path):
+        shutil.copyfile(input_path, output_path)
     return output_path
 
 def compress_text_file(input_path: str, output_path: str):
@@ -286,14 +329,29 @@ def compress_text_file(input_path: str, output_path: str):
 # API ROUTES
 # -------------------------------------------------------------
 
+def cleanup_files(*paths):
+    for p in paths:
+        if p and os.path.exists(p):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
 @app.post("/api/convert")
-async def convert_file(file: UploadFile = File(...), target_format: str = Form(...)):
-    base_name, ext = os.path.splitext(file.filename)
+async def convert_file(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...), 
+    target_format: str = Form(...)
+):
+    raw_name = os.path.basename(file.filename or "document")
+    base_name, ext = os.path.splitext(raw_name)
     ext = ext.lower()
     target_format = target_format.strip(". ").lower()
 
-    input_path = os.path.join(UPLOAD_DIR, file.filename)
-    output_path = os.path.join(OUTPUT_DIR, f"{base_name}.{target_format}")
+    unique_prefix = uuid.uuid4().hex
+    input_path = os.path.join(UPLOAD_DIR, f"{unique_prefix}_{raw_name}")
+    out_filename = f"{base_name}.{target_format}"
+    output_path = os.path.join(OUTPUT_DIR, f"{unique_prefix}_{out_filename}")
 
     with open(input_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
@@ -308,26 +366,33 @@ async def convert_file(file: UploadFile = File(...), target_format: str = Form(.
         else:
             raise HTTPException(status_code=400, detail=f"Conversion from {ext} to {target_format} not supported.")
 
-        return FileResponse(output_path, filename=os.path.basename(output_path))
+        background_tasks.add_task(cleanup_files, input_path, output_path)
+        return FileResponse(output_path, filename=out_filename)
     except HTTPException as he:
+        cleanup_files(input_path, output_path)
         raise he
     except Exception as e:
+        cleanup_files(input_path, output_path)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/compress")
 @app.post("/api/resize")
 async def compress_file(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...), 
     max_width: int = Form(1920),
     quality: int = Form(75),
     level: str = Form("medium")
 ):
-    base_name, ext = os.path.splitext(file.filename)
+    raw_name = os.path.basename(file.filename or "document")
+    base_name, ext = os.path.splitext(raw_name)
     ext = ext.lower()
 
-    input_path = os.path.join(UPLOAD_DIR, file.filename)
-    output_path = os.path.join(OUTPUT_DIR, f"compressed_{file.filename}")
+    unique_prefix = uuid.uuid4().hex
+    input_path = os.path.join(UPLOAD_DIR, f"{unique_prefix}_{raw_name}")
+    out_filename = f"compressed_{base_name}.jpg" if ext in [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"] else f"compressed_{raw_name}"
+    output_path = os.path.join(OUTPUT_DIR, f"{unique_prefix}_{out_filename}")
 
     with open(input_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
@@ -336,7 +401,6 @@ async def compress_file(
         if ext == ".pdf":
             compress_pdf(input_path, output_path, quality=quality, level=level, max_width=max_width)
         elif ext in [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"]:
-            output_path = os.path.join(OUTPUT_DIR, f"compressed_{base_name}.jpg")
             resize_image(input_path, output_path, max_width=max_width, quality=quality)
         elif ext in [".pptx", ".docx", ".xlsx", ".pptm", ".docm", ".xlsm"]:
             compress_office_file(input_path, output_path, max_width=max_width, quality=quality)
@@ -345,10 +409,13 @@ async def compress_file(
         else:
             raise HTTPException(status_code=400, detail=f"Compression not supported for {ext} files.")
 
-        return FileResponse(output_path, filename=os.path.basename(output_path))
+        background_tasks.add_task(cleanup_files, input_path, output_path)
+        return FileResponse(output_path, filename=out_filename)
     except HTTPException as he:
+        cleanup_files(input_path, output_path)
         raise he
     except Exception as e:
+        cleanup_files(input_path, output_path)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 

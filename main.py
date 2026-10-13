@@ -7,6 +7,7 @@ import shutil
 import zipfile
 import traceback
 import fitz  # PyMuPDF
+from typing import Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from PIL import Image
@@ -165,92 +166,230 @@ def pdf_to_pptx(input_path: str, output_path: str):
 # UNIVERSAL DOCUMENT RESIZING & COMPRESSION ROUTINES
 # -------------------------------------------------------------
 
-def compress_pdf(input_path: str, output_path: str, quality: int = 70, level: str = "medium", max_width: int = 1600):
+def compress_pdf(input_path: str, output_path: str, target_bytes: Optional[int] = None, quality: int = 70, level: str = "medium", max_width: int = 1600):
     """
-    Compresses PDF documents.
+    Compresses PDF documents with precision target-seeking.
     Preserves searchable vector text while downsampling embedded images and deflating streams.
+    Applies adaptive rasterization when vector stream optimization cannot reach requested target.
     """
-    doc = fitz.open(input_path)
-    
-    if level == "aggressive" or level == "high":
-        # Full raster page downsampling for maximum file size reduction
-        opt_doc = fitz.open()
-        for page in doc:
-            pix = page.get_pixmap(dpi=110)
-            img_bytes = pix.tobytes("jpeg", quality=quality)
-            new_page = opt_doc.new_page(width=page.rect.width, height=page.rect.height)
-            new_page.insert_image(page.rect, stream=img_bytes)
-        opt_doc.save(output_path, garbage=4, deflate=True)
-        doc.close()
-        opt_doc.close()
-        return output_path
-
-    # Standard / Medium: Downsample embedded images without degrading text vector sharpness
-    for page in doc:
-        image_list = page.get_images(full=True)
-        for img_info in image_list:
-            xref = img_info[0]
-            try:
-                base_image = doc.extract_image(xref)
-                if base_image:
-                    image_bytes = base_image["image"]
-                    pil_img = Image.open(io.BytesIO(image_bytes))
-                    if pil_img.width > max_width or pil_img.height > max_width or len(image_bytes) > 80_000:
-                        pil_img = pil_img.convert("RGB")
-                        if pil_img.width > max_width:
-                            ratio = max_width / float(pil_img.width)
-                            new_h = int(float(pil_img.height) * float(ratio))
-                            pil_img = pil_img.resize((max_width, new_h), Image.Resampling.LANCZOS)
-                        out_io = io.BytesIO()
-                        pil_img.save(out_io, format="JPEG", quality=quality, optimize=True)
-                        new_bytes = out_io.getvalue()
-                        if len(new_bytes) < len(image_bytes):
-                            doc.update_stream(xref, new_bytes)
-            except Exception:
-                pass
-
-    doc.save(output_path, garbage=4, deflate=True, deflate_images=True, deflate_fonts=True, clean=True)
-    doc.close()
-    return output_path
-
-def resize_image(input_path: str, output_path: str, max_width: int = 1920, quality: int = 75):
-    """
-    Resizes image dimensions and compresses quality using Lanczos resampling.
-    """
-    try:
-        with Image.open(input_path) as img:
-            img = img.convert("RGB")
-            if img.width > max_width:
-                ratio = max_width / float(img.width)
-                new_height = int(float(img.height) * float(ratio))
-                img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
-            img.save(output_path, "JPEG", optimize=True, quality=quality)
-        return output_path
-    except Exception:
-        # If PIL cannot parse stream or format, compress raw bytes or preserve
-        try:
-            with open(input_path, 'rb') as f_in:
-                raw_bytes = f_in.read()
-            import zlib
-            compressed = zlib.compress(raw_bytes, level=9)
-            if len(compressed) < len(raw_bytes):
-                with open(output_path, 'wb') as f_out:
-                    f_out.write(compressed)
-                return output_path
-        except Exception:
-            pass
+    orig_size = os.path.getsize(input_path)
+    if target_bytes and orig_size <= target_bytes:
         shutil.copyfile(input_path, output_path)
         return output_path
 
-def compress_office_file(input_path: str, output_path: str, max_width: int = 1600, quality: int = 70):
+    if target_bytes:
+        ratio = max(0.02, min(1.0, float(target_bytes) / float(orig_size)))
+        if ratio >= 0.75:
+            calc_quality = 75
+            calc_max_w = 1600
+        elif ratio >= 0.50:
+            calc_quality = 65
+            calc_max_w = 1280
+        elif ratio >= 0.30:
+            calc_quality = 50
+            calc_max_w = 960
+        elif ratio >= 0.15:
+            calc_quality = 35
+            calc_max_w = 720
+        else:
+            calc_quality = 25
+            calc_max_w = 540
+    else:
+        ratio = 0.5
+        calc_quality = quality
+        calc_max_w = max_width
+
+    # Pass 1: Vector-preserving stream optimization & embedded image downsampling
+    temp_v1 = output_path + ".v1.pdf"
+    try:
+        doc = fitz.open(input_path)
+        for page in doc:
+            image_list = page.get_images(full=True)
+            for img_info in image_list:
+                xref = img_info[0]
+                try:
+                    base_image = doc.extract_image(xref)
+                    if base_image:
+                        image_bytes = base_image["image"]
+                        pil_img = Image.open(io.BytesIO(image_bytes))
+                        if pil_img.width > calc_max_w or pil_img.height > calc_max_w or len(image_bytes) > 40_000:
+                            pil_img = pil_img.convert("RGB")
+                            if pil_img.width > calc_max_w:
+                                w_ratio = calc_max_w / float(pil_img.width)
+                                new_h = int(float(pil_img.height) * float(w_ratio))
+                                pil_img = pil_img.resize((calc_max_w, new_h), Image.Resampling.LANCZOS)
+                            out_io = io.BytesIO()
+                            pil_img.save(out_io, format="JPEG", quality=calc_quality, optimize=True)
+                            new_bytes = out_io.getvalue()
+                            if len(new_bytes) < len(image_bytes):
+                                doc.update_stream(xref, new_bytes)
+                except Exception:
+                    pass
+
+        doc.save(temp_v1, garbage=4, deflate=True, deflate_images=True, deflate_fonts=True, clean=True)
+        doc.close()
+        v1_size = os.path.getsize(temp_v1)
+    except Exception:
+        v1_size = orig_size
+
+    if target_bytes is None or v1_size <= int(target_bytes * 1.06) or ratio >= 0.85:
+        if os.path.exists(temp_v1):
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            shutil.move(temp_v1, output_path)
+            return output_path
+
+    # Pass 2: Adaptive rasterization when vector optimization cannot reach small target
+    try:
+        doc = fitz.open(input_path)
+        num_pages = max(1, len(doc))
+        bytes_per_page = int(target_bytes / num_pages) if target_bytes else 80_000
+
+        if bytes_per_page >= 140_000:
+            dpi = 120
+            q = 75
+        elif bytes_per_page >= 80_000:
+            dpi = 96
+            q = 65
+        elif bytes_per_page >= 45_000:
+            dpi = 84
+            q = 55
+        elif bytes_per_page >= 25_000:
+            dpi = 72
+            q = 45
+        elif bytes_per_page >= 15_000:
+            dpi = 60
+            q = 35
+        else:
+            dpi = 50
+            q = 25
+
+        def raster_pass(target_dpi, target_q, out_file):
+            opt_doc = fitz.open()
+            for page in doc:
+                pix = page.get_pixmap(dpi=target_dpi)
+                img_bytes = pix.tobytes("jpeg", quality=target_q)
+                new_page = opt_doc.new_page(width=page.rect.width, height=page.rect.height)
+                new_page.insert_image(page.rect, stream=img_bytes)
+            opt_doc.save(out_file, garbage=4, deflate=True)
+            opt_doc.close()
+            return os.path.getsize(out_file)
+
+        temp_r1 = output_path + ".r1.pdf"
+        r1_size = raster_pass(dpi, q, temp_r1)
+
+        if target_bytes and r1_size > target_bytes * 1.10 and dpi > 50:
+            adjusted_dpi = max(50, int(dpi * 0.8))
+            adjusted_q = max(25, int(q * 0.8))
+            temp_r2 = output_path + ".r2.pdf"
+            r2_size = raster_pass(adjusted_dpi, adjusted_q, temp_r2)
+            if abs(r2_size - target_bytes) < abs(r1_size - target_bytes):
+                if os.path.exists(temp_r1):
+                    os.remove(temp_r1)
+                temp_r1 = temp_r2
+                r1_size = r2_size
+            else:
+                if os.path.exists(temp_r2):
+                    os.remove(temp_r2)
+
+        doc.close()
+
+        if target_bytes and abs(r1_size - target_bytes) < abs(v1_size - target_bytes) and r1_size < orig_size:
+            if os.path.exists(temp_v1):
+                os.remove(temp_v1)
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            shutil.move(temp_r1, output_path)
+            return output_path
+    except Exception:
+        pass
+
+    if os.path.exists(temp_v1):
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        shutil.move(temp_v1, output_path)
+        return output_path
+
+    shutil.copyfile(input_path, output_path)
+    return output_path
+
+def resize_image(input_path: str, output_path: str, target_bytes: Optional[int] = None, max_width: int = 1920, quality: int = 75):
+    """
+    Resizes image dimensions and compresses quality with binary-search target-seeking accuracy.
+    """
+    try:
+        orig_size = os.path.getsize(input_path)
+        if target_bytes and orig_size <= target_bytes:
+            shutil.copyfile(input_path, output_path)
+            return output_path
+
+        with Image.open(input_path) as img:
+            img = img.convert("RGB")
+            orig_w, orig_h = img.width, img.height
+
+            if not target_bytes:
+                curr_w = min(orig_w, max_width)
+                if curr_w < orig_w:
+                    new_h = int(orig_h * (curr_w / float(orig_w)))
+                    img = img.resize((curr_w, new_h), Image.Resampling.LANCZOS)
+                img.save(output_path, "JPEG", optimize=True, quality=quality)
+                return output_path
+
+            ratio = max(0.01, min(1.0, float(target_bytes) / float(orig_size)))
+            scale = min(1.0, max(0.15, (ratio ** 0.5) * 1.15))
+
+            curr_w = max(64, min(orig_w, int(orig_w * scale)))
+            curr_h = max(64, min(orig_h, int(orig_h * scale)))
+            scaled_img = img.resize((curr_w, curr_h), Image.Resampling.LANCZOS)
+
+            best_data = None
+            best_diff = float('inf')
+
+            low_q, high_q = 15, 95
+            for _ in range(6):
+                mid_q = (low_q + high_q) // 2
+                buf = io.BytesIO()
+                scaled_img.save(buf, "JPEG", optimize=True, quality=mid_q)
+                data = buf.getvalue()
+                sz = len(data)
+                diff = abs(sz - target_bytes)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_data = data
+
+                if sz > target_bytes:
+                    high_q = mid_q - 1
+                else:
+                    low_q = mid_q + 1
+                if low_q > high_q:
+                    break
+
+            if len(best_data) > target_bytes * 1.20 and curr_w > 120:
+                dim_factor = max(0.3, (target_bytes / float(len(best_data))) ** 0.5)
+                w2 = max(64, int(curr_w * dim_factor))
+                h2 = max(64, int(curr_h * dim_factor))
+                scaled_img2 = img.resize((w2, h2), Image.Resampling.LANCZOS)
+                buf2 = io.BytesIO()
+                scaled_img2.save(buf2, "JPEG", optimize=True, quality=max(20, low_q))
+                data2 = buf2.getvalue()
+                if abs(len(data2) - target_bytes) < abs(len(best_data) - target_bytes):
+                    best_data = data2
+
+            with open(output_path, "wb") as f_out:
+                f_out.write(best_data)
+            return output_path
+    except Exception:
+        shutil.copyfile(input_path, output_path)
+        return output_path
+
+def compress_office_file(input_path: str, output_path: str, target_bytes: Optional[int] = None, max_width: int = 1600, quality: int = 70):
     """
     Compresses Microsoft Office documents (.docx, .pptx, .xlsx) by:
-    1. Compressing and downsampling embedded media images
+    1. Compressing and downsampling embedded media images with target adaptation
     2. Minifying XML content trees
     3. Repacking archive with maximum ZIP deflate compression
     """
     if not zipfile.is_zipfile(input_path):
-        # Non-zip container: deflate raw stream or copy directly
         try:
             with open(input_path, 'rb') as f_in:
                 raw_bytes = f_in.read()
@@ -265,9 +404,23 @@ def compress_office_file(input_path: str, output_path: str, max_width: int = 160
         shutil.copyfile(input_path, output_path)
         return output_path
 
-    try:
+    orig_size = os.path.getsize(input_path)
+    if target_bytes and orig_size <= target_bytes:
+        shutil.copyfile(input_path, output_path)
+        return output_path
+
+    if target_bytes:
+        ratio = max(0.05, min(1.0, float(target_bytes) / float(orig_size)))
+        eff_quality = max(20, min(85, int(ratio * 80 + 10)))
+        eff_max_width = max(480, min(1920, int(1920 * (ratio ** 0.5))))
+    else:
+        ratio = 0.5
+        eff_quality = quality
+        eff_max_width = max_width
+
+    def build_repacked_zip(target_w, target_q, out_file):
         with zipfile.ZipFile(input_path, 'r') as in_zip, \
-             zipfile.ZipFile(output_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as out_zip:
+             zipfile.ZipFile(out_file, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as out_zip:
             for item in in_zip.infolist():
                 try:
                     data = in_zip.read(item.filename)
@@ -279,12 +432,12 @@ def compress_office_file(input_path: str, output_path: str, max_width: int = 160
                         img = Image.open(io.BytesIO(data))
                         orig_len = len(data)
                         img = img.convert("RGB")
-                        if img.width > max_width:
-                            ratio = max_width / float(img.width)
-                            new_height = int(float(img.height) * float(ratio))
-                            img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
+                        if img.width > target_w:
+                            w_ratio = target_w / float(img.width)
+                            new_height = int(float(img.height) * float(w_ratio))
+                            img = img.resize((target_w, new_height), Image.Resampling.LANCZOS)
                         img_byte_arr = io.BytesIO()
-                        img.save(img_byte_arr, format='JPEG', optimize=True, quality=quality)
+                        img.save(img_byte_arr, format='JPEG', optimize=True, quality=target_q)
                         compressed_data = img_byte_arr.getvalue()
                         if len(compressed_data) < orig_len:
                             data = compressed_data
@@ -298,22 +451,31 @@ def compress_office_file(input_path: str, output_path: str, max_width: int = 160
                     except Exception:
                         pass
                 out_zip.writestr(item, data)
+        return os.path.getsize(out_file)
 
-        if os.path.exists(output_path) and os.path.getsize(output_path) > os.path.getsize(input_path):
+    try:
+        temp_pass1 = output_path + ".p1.zip"
+        p1_size = build_repacked_zip(eff_max_width, eff_quality, temp_pass1)
+
+        if target_bytes and p1_size > target_bytes * 1.15 and ratio < 0.65:
+            temp_pass2 = output_path + ".p2.zip"
+            p2_quality = max(15, eff_quality - 25)
+            p2_max_width = max(360, int(eff_max_width * 0.7))
+            p2_size = build_repacked_zip(p2_max_width, p2_quality, temp_pass2)
+            if abs(p2_size - target_bytes) < abs(p1_size - target_bytes):
+                if os.path.exists(temp_pass1):
+                    os.remove(temp_pass1)
+                temp_pass1 = temp_pass2
+
+        if os.path.exists(temp_pass1):
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            shutil.move(temp_pass1, output_path)
+
+        if os.path.exists(output_path) and os.path.getsize(output_path) > orig_size:
             shutil.copyfile(input_path, output_path)
         return output_path
     except Exception:
-        try:
-            with open(input_path, 'rb') as f_in:
-                raw_bytes = f_in.read()
-            import zlib
-            compressed = zlib.compress(raw_bytes, level=9)
-            if len(compressed) < len(raw_bytes):
-                with open(output_path, 'wb') as f_out:
-                    f_out.write(compressed)
-                return output_path
-        except Exception:
-            pass
         shutil.copyfile(input_path, output_path)
         return output_path
 
@@ -401,7 +563,9 @@ async def compress_file(
     file: UploadFile = File(...), 
     max_width: int = Form(1920),
     quality: int = Form(75),
-    level: str = Form("medium")
+    level: str = Form("medium"),
+    target_size_kb: Optional[float] = Form(None),
+    target_reduction_percent: Optional[float] = Form(None)
 ):
     raw_name = os.path.basename(file.filename or "document")
     base_name, ext = os.path.splitext(raw_name)
@@ -415,13 +579,21 @@ async def compress_file(
     with open(input_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
+    orig_size = os.path.getsize(input_path)
+    target_bytes = None
+    if target_size_kb is not None and float(target_size_kb) > 0:
+        target_bytes = int(float(target_size_kb) * 1024)
+    elif target_reduction_percent is not None and float(target_reduction_percent) > 0:
+        factor = max(0.05, min(0.95, (100.0 - float(target_reduction_percent)) / 100.0))
+        target_bytes = int(orig_size * factor)
+
     try:
         if ext == ".pdf":
-            compress_pdf(input_path, output_path, quality=quality, level=level, max_width=max_width)
+            compress_pdf(input_path, output_path, target_bytes=target_bytes, quality=quality, level=level, max_width=max_width)
         elif ext in [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"]:
-            resize_image(input_path, output_path, max_width=max_width, quality=quality)
+            resize_image(input_path, output_path, target_bytes=target_bytes, max_width=max_width, quality=quality)
         elif ext in [".pptx", ".docx", ".xlsx", ".pptm", ".docm", ".xlsm"]:
-            compress_office_file(input_path, output_path, max_width=max_width, quality=quality)
+            compress_office_file(input_path, output_path, target_bytes=target_bytes, max_width=max_width, quality=quality)
         elif ext in [".json", ".csv", ".xml", ".txt", ".html", ".htm", ".md", ".sql"]:
             compress_text_file(input_path, output_path)
         else:

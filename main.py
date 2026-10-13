@@ -265,39 +265,57 @@ def compress_office_file(input_path: str, output_path: str, max_width: int = 160
         shutil.copyfile(input_path, output_path)
         return output_path
 
-    with zipfile.ZipFile(input_path, 'r') as in_zip, \
-         zipfile.ZipFile(output_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as out_zip:
-        for item in in_zip.infolist():
-            data = in_zip.read(item.filename)
-            ext = os.path.splitext(item.filename)[1].lower()
-            if ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp']:
+    try:
+        with zipfile.ZipFile(input_path, 'r') as in_zip, \
+             zipfile.ZipFile(output_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as out_zip:
+            for item in in_zip.infolist():
                 try:
-                    img = Image.open(io.BytesIO(data))
-                    orig_len = len(data)
-                    img = img.convert("RGB")
-                    if img.width > max_width:
-                        ratio = max_width / float(img.width)
-                        new_height = int(float(img.height) * float(ratio))
-                        img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
-                    img_byte_arr = io.BytesIO()
-                    img.save(img_byte_arr, format='JPEG', optimize=True, quality=quality)
-                    compressed_data = img_byte_arr.getvalue()
-                    if len(compressed_data) < orig_len:
-                        data = compressed_data
+                    data = in_zip.read(item.filename)
                 except Exception:
-                    pass
-            elif ext in ['.xml', '.rels']:
-                try:
-                    text = data.decode('utf-8')
-                    minified = re.sub(r'>\s+<', '><', text).strip()
-                    data = minified.encode('utf-8')
-                except Exception:
-                    pass
-            out_zip.writestr(item, data)
+                    continue
+                ext = os.path.splitext(item.filename)[1].lower()
+                if ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp']:
+                    try:
+                        img = Image.open(io.BytesIO(data))
+                        orig_len = len(data)
+                        img = img.convert("RGB")
+                        if img.width > max_width:
+                            ratio = max_width / float(img.width)
+                            new_height = int(float(img.height) * float(ratio))
+                            img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
+                        img_byte_arr = io.BytesIO()
+                        img.save(img_byte_arr, format='JPEG', optimize=True, quality=quality)
+                        compressed_data = img_byte_arr.getvalue()
+                        if len(compressed_data) < orig_len:
+                            data = compressed_data
+                    except Exception:
+                        pass
+                elif ext in ['.xml', '.rels']:
+                    try:
+                        text = data.decode('utf-8')
+                        minified = re.sub(r'>\s+<', '><', text).strip()
+                        data = minified.encode('utf-8')
+                    except Exception:
+                        pass
+                out_zip.writestr(item, data)
 
-    if os.path.exists(output_path) and os.path.getsize(output_path) > os.path.getsize(input_path):
+        if os.path.exists(output_path) and os.path.getsize(output_path) > os.path.getsize(input_path):
+            shutil.copyfile(input_path, output_path)
+        return output_path
+    except Exception:
+        try:
+            with open(input_path, 'rb') as f_in:
+                raw_bytes = f_in.read()
+            import zlib
+            compressed = zlib.compress(raw_bytes, level=9)
+            if len(compressed) < len(raw_bytes):
+                with open(output_path, 'wb') as f_out:
+                    f_out.write(compressed)
+                return output_path
+        except Exception:
+            pass
         shutil.copyfile(input_path, output_path)
-    return output_path
+        return output_path
 
 def compress_text_file(input_path: str, output_path: str):
     """

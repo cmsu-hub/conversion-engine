@@ -1,5 +1,7 @@
 import os
 import io
+import re
+import json
 import shutil
 import zipfile
 import traceback
@@ -152,26 +154,61 @@ def pdf_to_pptx(input_path: str, output_path: str):
     return output_path
 
 # -------------------------------------------------------------
-# COMPRESSION ROUTINES
+# UNIVERSAL DOCUMENT RESIZING & COMPRESSION ROUTINES
 # -------------------------------------------------------------
 
-def compress_pdf(input_path: str, output_path: str, dpi: int = 100):
+def compress_pdf(input_path: str, output_path: str, quality: int = 70, level: str = "medium", max_width: int = 1600):
+    """
+    Compresses PDF documents.
+    Preserves searchable vector text while downsampling embedded images and deflating streams.
+    """
     doc = fitz.open(input_path)
-    opt_doc = fitz.open()
+    
+    if level == "aggressive" or level == "high":
+        # Full raster page downsampling for maximum file size reduction
+        opt_doc = fitz.open()
+        for page in doc:
+            pix = page.get_pixmap(dpi=110)
+            img_bytes = pix.tobytes("jpeg", quality=quality)
+            new_page = opt_doc.new_page(width=page.rect.width, height=page.rect.height)
+            new_page.insert_image(page.rect, stream=img_bytes)
+        opt_doc.save(output_path, garbage=4, deflate=True)
+        doc.close()
+        opt_doc.close()
+        return output_path
 
+    # Standard / Medium: Downsample embedded images without degrading text vector sharpness
     for page in doc:
-        pix = page.get_pixmap(dpi=dpi)
-        img_bytes = pix.tobytes("jpeg", quality=70)
-        
-        new_page = opt_doc.new_page(width=page.rect.width, height=page.rect.height)
-        new_page.insert_image(page.rect, stream=img_bytes)
+        image_list = page.get_images(full=True)
+        for img_info in image_list:
+            xref = img_info[0]
+            try:
+                base_image = doc.extract_image(xref)
+                if base_image:
+                    image_bytes = base_image["image"]
+                    pil_img = Image.open(io.BytesIO(image_bytes))
+                    if pil_img.width > max_width or pil_img.height > max_width or len(image_bytes) > 80_000:
+                        pil_img = pil_img.convert("RGB")
+                        if pil_img.width > max_width:
+                            ratio = max_width / float(pil_img.width)
+                            new_h = int(float(pil_img.height) * float(ratio))
+                            pil_img = pil_img.resize((max_width, new_h), Image.Resampling.LANCZOS)
+                        out_io = io.BytesIO()
+                        pil_img.save(out_io, format="JPEG", quality=quality, optimize=True)
+                        new_bytes = out_io.getvalue()
+                        if len(new_bytes) < len(image_bytes):
+                            doc.update_stream(xref, new_bytes)
+            except Exception:
+                pass
 
-    opt_doc.save(output_path, garbage=4, deflate=True)
+    doc.save(output_path, garbage=4, deflate=True, deflate_images=True, deflate_fonts=True, clean=True)
     doc.close()
-    opt_doc.close()
     return output_path
 
 def resize_image(input_path: str, output_path: str, max_width: int = 1920, quality: int = 75):
+    """
+    Resizes image dimensions and compresses quality using Lanczos resampling.
+    """
     with Image.open(input_path) as img:
         img = img.convert("RGB")
         if img.width > max_width:
@@ -181,26 +218,68 @@ def resize_image(input_path: str, output_path: str, max_width: int = 1920, quali
         img.save(output_path, "JPEG", optimize=True, quality=quality)
     return output_path
 
-def compress_office_file(input_path: str, output_path: str, max_width: int = 1920, quality: int = 70):
-    with zipfile.ZipFile(input_path, 'r') as in_zip, zipfile.ZipFile(output_path, 'w', compression=zipfile.ZIP_DEFLATED) as out_zip:
+def compress_office_file(input_path: str, output_path: str, max_width: int = 1600, quality: int = 70):
+    """
+    Compresses Microsoft Office documents (.docx, .pptx, .xlsx) by:
+    1. Compressing and downsampling embedded media images
+    2. Minifying XML content trees
+    3. Repacking archive with maximum ZIP deflate compression
+    """
+    with zipfile.ZipFile(input_path, 'r') as in_zip, \
+         zipfile.ZipFile(output_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as out_zip:
         for item in in_zip.infolist():
             data = in_zip.read(item.filename)
-            ext = os.path.splitext(item.filename).lower()
-            if ext in ['.jpg', '.jpeg', '.png', '.webp']:
+            ext = os.path.splitext(item.filename)[1].lower()
+            if ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp']:
                 try:
                     img = Image.open(io.BytesIO(data))
+                    orig_len = len(data)
                     img = img.convert("RGB")
                     if img.width > max_width:
                         ratio = max_width / float(img.width)
                         new_height = int(float(img.height) * float(ratio))
                         img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
-                    
                     img_byte_arr = io.BytesIO()
                     img.save(img_byte_arr, format='JPEG', optimize=True, quality=quality)
-                    data = img_byte_arr.getvalue()
+                    compressed_data = img_byte_arr.getvalue()
+                    if len(compressed_data) < orig_len:
+                        data = compressed_data
+                except Exception:
+                    pass
+            elif ext in ['.xml', '.rels']:
+                try:
+                    text = data.decode('utf-8')
+                    minified = re.sub(r'>\s+<', '><', text).strip()
+                    data = minified.encode('utf-8')
                 except Exception:
                     pass
             out_zip.writestr(item, data)
+    return output_path
+
+def compress_text_file(input_path: str, output_path: str):
+    """
+    Minifies text, JSON, HTML, CSV, and XML document files.
+    """
+    with open(input_path, 'r', encoding='utf-8', errors='ignore') as f:
+        content = f.read()
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext == '.json':
+        try:
+            obj = json.loads(content)
+            minified = json.dumps(obj, separators=(',', ':'))
+        except Exception:
+            minified = content
+    elif ext in ['.html', '.htm', '.xml']:
+        minified = re.sub(r'<!--[\s\S]*?-->', '', content)
+        minified = re.sub(r'>\s+<', '><', minified).strip()
+    elif ext == '.csv':
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        minified = '\n'.join(lines)
+    else:
+        minified = re.sub(r'[ \t]+', ' ', content)
+        minified = re.sub(r'\n{3,}', '\n\n', minified).strip()
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(minified)
     return output_path
 
 # -------------------------------------------------------------
@@ -237,9 +316,12 @@ async def convert_file(file: UploadFile = File(...), target_format: str = Form(.
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/compress")
+@app.post("/api/resize")
 async def compress_file(
     file: UploadFile = File(...), 
-    max_width: int = Form(1920)
+    max_width: int = Form(1920),
+    quality: int = Form(75),
+    level: str = Form("medium")
 ):
     base_name, ext = os.path.splitext(file.filename)
     ext = ext.lower()
@@ -252,12 +334,14 @@ async def compress_file(
 
     try:
         if ext == ".pdf":
-            compress_pdf(input_path, output_path)
-        elif ext in [".jpg", ".jpeg", ".png", ".webp"]:
+            compress_pdf(input_path, output_path, quality=quality, level=level, max_width=max_width)
+        elif ext in [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"]:
             output_path = os.path.join(OUTPUT_DIR, f"compressed_{base_name}.jpg")
-            resize_image(input_path, output_path, max_width=max_width)
-        elif ext in [".pptx", ".docx", ".xlsx"]:
-            compress_office_file(input_path, output_path, max_width=max_width)
+            resize_image(input_path, output_path, max_width=max_width, quality=quality)
+        elif ext in [".pptx", ".docx", ".xlsx", ".pptm", ".docm", ".xlsm"]:
+            compress_office_file(input_path, output_path, max_width=max_width, quality=quality)
+        elif ext in [".json", ".csv", ".xml", ".txt", ".html", ".htm", ".md", ".sql"]:
+            compress_text_file(input_path, output_path)
         else:
             raise HTTPException(status_code=400, detail=f"Compression not supported for {ext} files.")
 
